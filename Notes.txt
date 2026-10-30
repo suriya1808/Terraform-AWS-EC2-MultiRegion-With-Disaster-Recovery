@@ -1,0 +1,208 @@
+TERRAFORM PROJECT - MY BUILD NOTES
+==================================
+The steps I followed to build this project, what I learned at each step,
+and the commands I need. For the full explanation, see README.md.
+
+Login: no .tfvars file and no secrets in the code. I log in with the AWS CLI
+in the browser (aws login), and Terraform uses that login.
+
+
+------------------------------------------------------------------------
+PART 1 - BUILD STEPS (in the order I did them)
+------------------------------------------------------------------------
+
+Step 1. Created provider.tf
+   - Told Terraform to use the hashicorp/aws provider, version ~> 6.0
+     (any 6.x, never 7.0).
+   - Ran: terraform init  (downloads the provider into .terraform/ and
+     creates .terraform.lock.hcl)
+
+Step 2. Created variables.tf
+   - instance_type = t3.micro
+   - A variable block can only contain: type, description, default,
+     sensitive, nullable, ephemeral, validation. Anything else = error.
+
+Step 3. Created main.tf with the Ubuntu AMI lookup and one EC2 server
+   - AMI = Amazon Machine Image (OS template the server boots from).
+   - "data" block = only looks something up. "resource" block = creates it.
+   - owners = 099720109477 is Canonical (Ubuntu). 309956199498 is Red Hat.
+
+Step 4. Added environments (dev, qa, prod) with for_each
+   - variable "environment" is a set: ["dev", "qa", "prod"]
+   - for_each makes one copy per item; each.key = the current item.
+   - Typo I made: eack.key  ->  must be each.key
+
+Step 5. Added two regions in provider.tf using alias
+   - nonprod = eu-west-1 (Ireland)  -> dev, qa
+   - prod    = ap-south-1 (Mumbai)  -> prod
+   - MISTAKE I made:
+       provider = each.key == "prod" ? aws.prod : aws.nonprod
+     This is NOT allowed. "provider" must be a fixed name like aws.prod.
+     terraform validate gave: "Invalid provider configuration reference".
+
+Step 6. Deleted main.tf, split it into ami.tf and ec2.tf
+   - AMI IDs are different in every region, so each region needs its own
+     AMI lookup (ubuntu_nonprod, ubuntu_prod).
+   - Two server blocks (nonprod, prod), each with a fixed provider.
+   - for_each filter to split environments:
+       if env != "prod"  -> {"dev", "qa"}
+       if env == "prod"  -> {"prod"}
+
+Step 7. Added vpc.tf and subnet.tf, connected servers to them
+   - VPC = my private network in a region. Subnet = a slice of it.
+   - vpc-nonprod 10.0.0.0/16 -> subnet-dev 10.0.1.0/24, subnet-qa 10.0.2.0/24
+   - vpc-prod    10.1.0.0/16 -> subnet-prod 10.1.1.0/24
+   - Added vpc_cidrs and subnet_cidrs maps to variables.tf.
+   - Removed the old unused subnet_id variable (plan kept asking for it).
+   - Added subnet_id = aws_subnet.<name>[each.key].id to each server.
+   - MISTAKE I made: put subnet_id inside tags {} and pointed prod at the
+     nonprod subnet. Validate passed, but plan would fail ("Invalid index").
+   - Every new environment needs an entry in subnet_cidrs too.
+   - No internet gateway yet, so all servers are private.
+
+Step 8. Disaster Recovery (DR) for prod
+   - Added a third region in provider.tf: dr = ap-southeast-1 (Singapore)
+   - Created backup.tf:
+       IAM role for AWS Backup + AWSBackupServiceRolePolicyForBackup
+       prod-vault (Mumbai) and prod-dr-vault (Singapore)
+       Backup plan: every night 18:00 UTC (23:30 IST), keep 7 days,
+       copy each backup to prod-dr-vault
+       Backup selection: backs up the prod server
+   - Created dr.tf:
+       vpc-dr 10.2.0.0/16 + subnet-dr 10.2.1.0/24 (always exist, free)
+       ec2-prod-dr: count = 0 when dr_ami_id is "", 1 when an AMI ID is given
+
+Step 9. Added DR variables in variables.tf
+   - Added "dr" to vpc_cidrs and subnet_cidrs
+   - backup_retention_days = 7
+   - dr_ami_id = "" (empty = no DR server)
+   - MISTAKE I made: added the new vpc_cidrs/subnet_cidrs blocks but kept
+     the old ones -> "Duplicate variable declaration". Deleted the old ones.
+
+Step 10. Prepared the project for GitHub
+   - Added comments to every .tf file
+   - Added .gitignore (never commit .terraform/ or *.tfstate;
+     DO commit .terraform.lock.hcl)
+   - Added README.md
+
+
+------------------------------------------------------------------------
+PART 2 - EVERYDAY COMMANDS
+------------------------------------------------------------------------
+
+terraform init        # first time, or after changing providers
+terraform fmt         # fix formatting
+terraform validate    # check for errors
+terraform plan        # preview (about 17 resources the first time)
+terraform apply       # create / update
+terraform destroy     # delete everything, including backups
+
+Tip: validate only checks the code. Some mistakes (like a wrong map key)
+only show up in terraform plan. Always run both.
+
+If the first apply fails on aws_backup_selection ("role cannot be assumed"),
+the new IAM role was not ready yet. Just run terraform apply again.
+
+
+------------------------------------------------------------------------
+PART 3 - HOW DISASTER RECOVERY WORKS
+------------------------------------------------------------------------
+
+ap-south-1 (prod)                          ap-southeast-1 (DR)
+┌───────────────────────┐   nightly copy   ┌───────────────────────────┐
+│ ec2-prod              │ ───────────────▶ │ prod-dr-vault (backups)   │
+│ AWS Backup plan       │                  │ vpc-dr + subnet-dr        │
+│ prod-vault (backups)  │                  │ ec2-prod-dr (only during  │
+└───────────────────────┘                  │ a failover)               │
+                                           └───────────────────────────┘
+
+AUTOMATIC (AWS Backup does it every night):
+   - Takes an AMI of ec2-prod -> prod-vault (Mumbai)
+   - Copies it -> prod-dr-vault (Singapore)
+   - Deletes backups older than 7 days
+
+MANUAL (I have to do it):
+   - Notice that Mumbai is down
+   - Find the newest backup
+   - Run terraform apply to create the Singapore server
+   Terraform does nothing on its own. It only acts when I run it.
+
+RPO (data I can lose)  = up to 24 hours (backup is once a day)
+RTO (time to recover)  = a few minutes after I start the failover
+
+The first backup only happens on the first night after apply.
+Before that, there is nothing to recover from.
+
+
+------------------------------------------------------------------------
+PART 4 - FAILOVER STEPS (when Mumbai is down)
+------------------------------------------------------------------------
+
+1. Find the newest backup in Singapore:
+   aws backup list-recovery-points-by-backup-vault --backup-vault-name prod-dr-vault --region ap-southeast-1 --query "sort_by(RecoveryPoints[?Status=='COMPLETED'], &CreationDate)[-1].RecoveryPointArn" --output text
+
+   Output looks like: arn:aws:ec2:ap-southeast-1::image/ami-0abc123def456
+   The AMI ID is the part after "image/" -> ami-0abc123def456
+   (Use the Singapore AMI ID, not a Mumbai one. AMI IDs are per region.)
+
+2. Create the DR server:
+   terraform apply -var="dr_ami_id=ami-0abc123def456" -target=aws_instance.dr -refresh=false
+
+   -target=aws_instance.dr  -> only touch the DR server
+   -refresh=false           -> don't try to contact Mumbai (it is down)
+
+3. Check: EC2 console -> region Singapore -> ec2-prod-dr is running.
+
+4. Real world: update DNS (Route 53) to point to the new server.
+   Not part of this project.
+
+
+------------------------------------------------------------------------
+PART 5 - FAILBACK (when Mumbai is back)
+------------------------------------------------------------------------
+
+1. Check ec2-prod in Mumbai is healthy.
+2. Copy back any changes made on the DR server while it was live.
+3. Run a normal apply (no -var):
+   terraform apply
+   dr_ami_id goes back to "" -> count = 0 -> Terraform deletes the DR server.
+
+
+------------------------------------------------------------------------
+PART 6 - TEST DR WITHOUT WAITING FOR THE NIGHTLY BACKUP
+------------------------------------------------------------------------
+
+Get the ARNs first:
+   terraform state show 'aws_instance.prod["prod"]'   -> prod instance ARN
+   terraform state show aws_iam_role.backup           -> backup role ARN
+   terraform state show aws_backup_vault.dr           -> dr vault ARN
+
+1. Back up prod now:
+   aws backup start-backup-job --backup-vault-name prod-vault --resource-arn <prod instance ARN> --iam-role-arn <backup role ARN> --region ap-south-1
+
+2. When it finishes, copy it to Singapore
+   (a manual backup does NOT copy automatically):
+   aws backup start-copy-job --recovery-point-arn <recovery point ARN from step 1> --source-backup-vault-name prod-vault --destination-backup-vault-arn <dr vault ARN> --iam-role-arn <backup role ARN> --region ap-south-1
+
+3. AWS console -> Singapore -> AWS Backup -> Vaults -> prod-dr-vault
+   -> check a recovery point is there.
+
+4. Do failover steps 1-3 (no -target / -refresh=false needed, Mumbai is up).
+
+5. Do the failback to delete the DR server.
+
+
+------------------------------------------------------------------------
+PART 7 - THINGS TO REMEMBER / NEXT STEPS
+------------------------------------------------------------------------
+
+- terraform.tfstate is local and NOT on GitHub. If I lose it, Terraform
+  forgets what it built. Keep a copy somewhere safe.
+  Next step: move state to an S3 backend (in a region other than prod).
+- Servers are private (no internet gateway).
+  Next step: igw.tf with internet gateway + route table + public IPs.
+- Failover is manual.
+  Next step: automatic failover with a health check (Route 53 /
+  CloudWatch) + EventBridge + Lambda.
+- Cost: servers, snapshot storage in 2 regions, cross-region copy.
+  Run terraform destroy when done.

@@ -1,0 +1,37 @@
+# Provider plugins downloaded by terraform init (large, machine-specific)
+.terraform/
+
+# State files: hold real resource IDs and can contain secrets. Never commit.
+*.tfstate
+*.tfstate.*
+
+# Saved plan files
+*.tfplan
+tfplan
+
+# Variable files often hold secrets or personal values
+*.tfvars
+*.tfvars.json
+
+# Local override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# CLI config
+.terraformrc
+terraform.rc
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Note: .terraform.lock.hcl is NOT ignored on purpose. Commit it so everyone
+# uses the same provider version.
